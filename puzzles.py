@@ -1,7 +1,21 @@
 import argparse
+from asyncio.constants import ACCEPT_RETRY_DELAY
+from curses import noecho
+from email.errors import MissingHeaderBodySeparatorDefect
+from importlib.machinery import OPTIMIZED_BYTECODE_SUFFIXES
+from math import exp, log2
+from pickle import NONE
+from re import escape
+from socket import MSG_PEEK
+from struct import unpack
+from turtle import hideturtle
 from typing import List
 import os
+from zoneinfo import TZPATH
 
+from networkx import multi_source_dijkstra, non_neighbors
+from numpy import dtype, float32, mask_indices
+from sympy import matrix_symbols
 import torch
 import triton
 import triton.language as tl
@@ -105,9 +119,14 @@ tl.load use mask: i < 4 and j < 3.
 def demo2(x_ptr):
     i_range = tl.arange(0, 8)[:, None]
     j_range = tl.arange(0, 4)[None, :]
+    print(i_range, end='\n\n')
+    print(j_range, end='\n\n')
     range = i_range * 4 + j_range
     # print works in the interpreter
     print(range)
+    print(i_range < 4, end='\n\n')
+    print(j_range < 3, end='\n\n')
+    print((i_range < 4) & (j_range < 3), end='\n\n')
     x = tl.load(x_ptr + range, (i_range < 4) & (j_range < 3), 0)
     print(x)
 
@@ -216,6 +235,8 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
     # Finish me!
+    z = x + 10.0
+    tl.store(z_ptr + off_x, z)
     return
 
 
@@ -237,6 +258,11 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    pid = tl.program_id(0)
+    range = tl.arange(0, B0) + pid * B0
+    x = tl.load(x_ptr + range, range < N0)
+    z = x + 10.0
+    tl.store(z_ptr + range, z, range < N0)
     return
 
 
@@ -260,6 +286,13 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    i_range = tl.arange(0, B0)[:, None]
+    j_range = tl.arange(0, B1)[None, :]
+    range =  N0 * j_range + i_range
+    x = tl.load(x_ptr + i_range)
+    y = tl.load(y_ptr + j_range)
+    z = x + y
+    tl.store(z_ptr + range, z)
     return
 
 
@@ -287,6 +320,19 @@ def add_vec_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    range_i = B0 * block_id_x + tl.arange(0, B0)[:, None]
+    range_j = B1 * block_id_y + tl.arange(0, B1)[None, :]
+    range_o = N0 * range_j + range_i    # range is absolute position
+
+    # print(range_i)
+    # print(range_j)
+    # print(range_o)
+
+    x = tl.load(x_ptr + range_i, range_i < N0)
+    y = tl.load(y_ptr + range_j, range_j < N1)
+    z = x + y
+    # print(x.shape, y.shape, z.shape)    # x.shape = range_i.shape, no matter masked or not
+    tl.store(z_ptr + range_o, z, (range_j < N1) & (range_i < N0))
     return
 
 
@@ -314,6 +360,18 @@ def mul_relu_block_kernel(
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
     # Finish me!
+    # check ans, for not knowing `where` op, optimize the varible name
+    offs_x = block_id_x * B0 + tl.arange(0, B0)     # pylance fake type error
+    offs_y = block_id_y * B1 + tl.arange(0, B1)
+    offs_z = offs_y[:, None] * N0 + offs_x[None, :]
+    mask_x = offs_x < N0
+    mask_y = offs_y < N1
+    mask_z = mask_y[:, None] & mask_x[None, :]
+    x = tl.load(x_ptr + offs_x, mask_x)
+    y = tl.load(y_ptr + offs_y, mask_y)
+    z = x[None, :] * y[:, None]
+    relu_z = tl.where(z > 0, z, 0.0)
+    tl.store(z_ptr + offs_z, relu_z, mask_z)
     return
 
 
@@ -354,6 +412,23 @@ def mul_relu_block_back_kernel(
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
     # Finish me!
+    offs_i = block_id_i * B0 + tl.arange(0, B0)
+    offs_j = block_id_j * B1 + tl.arange(0, B1)
+    offs_ji = offs_j[:, None] * N0 + offs_i[None, :]
+
+    mask_i = offs_i < N0
+    mask_j = offs_j < N1
+    mask_ji = mask_j[:, None] & mask_i[None, :]
+    
+    x = tl.load(x_ptr + offs_ji, mask_ji)
+    y = tl.load(y_ptr + offs_j, mask_j)
+    dz = tl.load(dz_ptr + offs_ji, mask_ji)
+    
+    df = tl.where(x * y[:, None] > 0, 1.0, 0.0)
+    dxy_x = y[:, None]
+    dx = df * dxy_x * dz
+    # print(dz.shape, y.shape, dx.shape)
+    tl.store(dx_ptr + offs_ji, dx, mask_ji)
     return
 
 
@@ -379,6 +454,20 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    blk_id_i = tl.program_id(0)
+    offs_i = blk_id_i * B0 + tl.arange(0, B0)
+    mask_i = offs_i < N0
+    
+    z = tl.zeros([B0], dtype=tl.float32)
+    
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = offs_i[:, None] * T + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offs_ij, mask_ij)
+        z += tl.sum(x, 1)
+    tl.store(z_ptr + offs_i, z, mask_i)
     return
 
 
@@ -420,6 +509,34 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    offs_i =  B0 * block_id_i + tl.arange(0, B0)
+    mask_i = offs_i < N0
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    x_max = tl.full([B0], -float("inf"), dtype=tl.float32)
+    x_max_new = tl.full([B0], -float("inf"), dtype=tl.float32)
+
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = offs_i[:, None] * T + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        
+        x = tl.load(x_ptr + offs_ij, mask_ij)
+        x_max_new = tl.maximum(x_max, tl.max(x, 1))
+        exp_x_new = tl.exp2(log2_e * (x - x_max_new[:, None]))
+        factor = tl.exp2(log2_e * (x_max - x_max_new))
+        exp_sum = exp_sum * factor + tl.sum(exp_x_new, 1)
+        x_max = x_max_new
+        
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = offs_i[:, None] * T + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offs_ij, mask_ij)
+        exp_x = tl.exp2(log2_e * (x - x_max[:, None]))
+        z = exp_x / exp_sum[:, None]
+        tl.store(z_ptr + offs_ij, z, mask_ij)
     return
 
 
@@ -431,6 +548,40 @@ def softmax_kernel_brute_force(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     # Finish me!
+    offs_i =  B0 * block_id_i + tl.arange(0, B0)
+    mask_i = offs_i < N0
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    x_max = tl.full([B0], -float("inf"), dtype=tl.float32)
+
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = offs_i[:, None] * T + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offs_ij, mask_ij)
+        
+        x_max = tl.maximum(x_max, tl.max(x, 1))
+    
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = offs_i[:, None] * T + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offs_ij, mask_ij)
+
+        exp_x = tl.exp2(log2_e * (x - x_max[:, None]))
+        exp_sum += tl.sum(exp_x, 1)
+
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = offs_i[:, None] * T + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + offs_ij, mask_ij)
+
+        exp_x = tl.exp2(log2_e * (x - x_max[:, None]))
+        z = exp_x / exp_sum[:, None]
+        tl.store(z_ptr + offs_ij, z, mask_ij)
     return
 
 
@@ -469,6 +620,42 @@ def flashatt_kernel(
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
     # Finish me!
+    offs_i = block_id_i * B0 + tl.arange(0, B0)
+    mask_i = offs_i < N0
+    q = tl.load(q_ptr + offs_i, mask_i)
+
+    qk_max = tl.full([B0], -float('inf'), dtype=tl.float32)
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    z = tl.zeros([B0], dtype=tl.float32)
+
+    for id_j in tl.range(0, T, B1):
+        offs_j = id_j + tl.arange(0, B1)
+        offs_ij = T * offs_i[:, None] + offs_j[None, :]
+        mask_j = offs_j < T
+        mask_ij = mask_i[:, None] & mask_j[None, :]
+        k = tl.load(k_ptr + offs_j, mask_j)
+        # /home/mengmm/workspace/github/Triton-Puzzles-Lite/.venv/lib/python3.12/site-packages/triton/runtime/interpreter.py:412: RuntimeWarning: invalid value encountered in subtract return TensorHandle(op(lhs.data, rhs.data), lhs.dtype.scalar)
+        # `qk_max` init via `-inf`, if exp((-inf) - (-inf)), warning
+        # qk = q[:, None] * k[None, :] + tl.where(mask_ij, 0.0, -float('inf'))
+        qk = q[:, None] * k[None, :]
+        # qk = tl.where(mask_ij, qk, -float('inf'))
+        # sol. 1, -1e9...
+        qk = tl.where(mask_ij, qk, -1e9)
+        qk_max_new = tl.maximum(qk_max, tl.max(qk, 1))
+        
+        qk_exp = myexp(qk - qk_max_new[:, None])
+        factor = myexp(qk_max - qk_max_new)
+
+        exp_sum = exp_sum * factor + tl.sum(qk_exp, 1)
+
+        v = tl.load(v_ptr + offs_j, mask_j)
+        z_new = qk_exp * v[None, :]
+        z = z * factor + tl.sum(z_new, 1)
+
+        qk_max = qk_max_new
+    # z is `(qk v)` under exp^{-m}, need / `exp_sum` under exp^{-m}
+    z = z / exp_sum
+    tl.store(z_ptr + offs_i, z, mask_i)
     return
 
 
@@ -502,6 +689,30 @@ def conv2d_kernel(
 ):
     block_id_i = tl.program_id(0)
     # Finish me!
+    offs_i = B0 * block_id_i + tl.arange(0, B0)
+    offs_h = tl.arange(0, KH)
+    offs_w = tl.arange(0, KW)
+    offs_hw = KW * offs_h[:, None] + offs_w[None, :]
+    mask_i = offs_i < N0
+    mask_h = offs_h < H
+    mask_w = offs_w < W
+    mask_hw = mask_h[:, None] & mask_w[None, :]
+    
+    k = tl.load(k_ptr + offs_hw)
+    
+    for h in tl.range(0, H):
+        for w in tl.range(0, W):
+            offs_h_oh = h + offs_h[None, :, None]
+            offs_w_ow = w + offs_w[None, None, :]
+            offs_x = H * W * offs_i[:, None, None] + W * offs_h_oh + offs_w_ow
+            mask_x = mask_i[:, None, None] & (offs_h_oh < H) & (offs_w_ow < W)
+            x = tl.load(x_ptr + offs_x, mask_x)
+            # z = tl.sum(tl.sum(x * k[None, :], 1), 1)
+            # [B0, KH, KW]
+            z = x * k[None, :]
+            z = tl.sum(tl.sum(z, 2), 1)
+            offs_z = offs_i * H * W + h * W + w
+            tl.store(z_ptr + offs_z, value=z)
     return
 
 
@@ -548,6 +759,30 @@ def dot_kernel(
     block_id_k = tl.program_id(1)
     block_id_i = tl.program_id(2)
     # Finish me!
+    offs_i = B2 * block_id_i + tl.arange(0, B2)
+    offs_j = B0 * block_id_j + tl.arange(0, B0)
+    offs_k = B1 * block_id_k + tl.arange(0, B1)
+    mask_i = offs_i < N2
+    mask_j = offs_j < N0
+    mask_k = offs_k < N1
+    # batch is B2, N2 ...
+    offs_z = N0 * N1 * offs_i[:, None, None] + N1 * offs_j[None, :, None] + offs_k[None, None, :]
+    mask_z = mask_i[:, None, None] & mask_j[None, :, None] & mask_k[None, None, :]
+    z = tl.zeros([B2, B0, B1], dtype=tl.float32)
+
+    for mid_id in tl.range(0, MID, B_MID):
+        offs_m = mid_id + tl.arange(0, B_MID)
+        mask_m = offs_m < MID
+        offs_x = N0 * MID * offs_i[:, None, None] + MID * offs_j[None, :, None] + offs_m[None, None, :]
+        offs_y = MID * N1 * offs_i[:, None, None] + N1 * offs_m[None, :, None] + offs_k[None, None, :]
+        mask_x = mask_i[:, None, None] & mask_j[None, :, None] & mask_m[None, None, :]
+        mask_y = mask_i[:, None, None] & mask_m[None, :, None] & mask_k[None, None, :]
+        
+        x = tl.load(x_ptr + offs_x, mask_x)
+        y = tl.load(y_ptr + offs_y, mask_y)
+        z += tl.dot(x, y)
+    
+    tl.store(z_ptr + offs_z, z, mask_z)
     return
 
 
@@ -614,6 +849,62 @@ def quant_dot_kernel(
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
     # Finish me!
+    offs_j = B0 * block_id_j + tl.arange(0, B0)
+    offs_k = B1 * block_id_k + tl.arange(0, B1)
+    mask_j = offs_j < N0
+    mask_k = offs_k < N1
+    offs_z = N1 * offs_j[:, None] + offs_k[None, :]
+    mask_z = mask_j[:, None] & mask_k[None, :]
+    z = tl.zeros([B0, B1], dtype=tl.float32)
+    
+    for mid_id in tl.range(0, MID, B_MID):
+        offs_l = mid_id + tl.arange(0, B_MID)
+        mask_l = offs_l < MID
+        # group
+        offs_l_div_g = mid_id // GROUP + tl.arange(0, B_MID // GROUP)
+        mask_l_div_g = offs_l_div_g < MID // GROUP
+        # scale (float32)
+        offs_sc = (MID // GROUP) * offs_j[:, None] + offs_l_div_g[None, :]
+        mask_sc = mask_j[:, None] & mask_l_div_g[None, :]
+        scale = tl.load(scale_ptr + offs_sc, mask_sc)
+        # offset / shift (4-bit)
+        offs_l_div_fpint_g = mid_id // FPINT // GROUP + tl.arange(0, B_MID // FPINT // GROUP)
+        mask_l_div_fpint_g = offs_l_div_fpint_g < MID // FPINT // GROUP
+        offs_of = (MID // FPINT // GROUP) * offs_j[:, None] + offs_l_div_fpint_g[None, :]
+        mask_of = mask_j[:, None] & mask_l_div_fpint_g[None, :]
+        # print(mask_j[:, None].shape, (offs_of < MID // FPINT // GROUP)[None, :].shape)
+        offset = tl.load(offset_ptr + offs_of, mask_of)
+        # weight (4-bit)
+        offs_l_div_fpint = mid_id // FPINT + tl.arange(0, B_MID // FPINT)
+        mask_l_div_fpint = offs_l_div_fpint < MID // FPINT
+        offs_w = (MID // FPINT) * offs_j[:, None] + offs_l_div_fpint[None, :]
+        mask_w = mask_j[:, None] & mask_l_div_fpint[None, :]
+        weight = tl.load(weight_ptr + offs_w, mask_w)
+        # activation (float32)
+        offs_ac = N1 * offs_l[:, None] + offs_k[None, :]
+        mask_ac = mask_l[:, None] & mask_k[None, :]
+        activate = tl.load(activation_ptr + offs_ac, mask_ac)
+        # unpack
+        BITS = 32 // FPINT
+        unpack_offs = tl.arange(0, FPINT) * BITS
+        unpack_mask = (1 << BITS) - 1
+        # ops like `>>`, `&` between tensors with different shape, will **broadcast**
+        # print("offset:", offset.shape)
+        # print("weight:", weight.shape)
+        unpack_offset = (offset[:, :, None] >> unpack_offs[None, :, None]) & unpack_mask
+        unpack_weight = (weight[:, :, None] >> unpack_offs[None, None, :]) & unpack_mask
+        # print("unpack_offset:", unpack_offset.shape)
+        # print("unpack_weight:", unpack_weight.shape)
+
+        # [BLOCK_J, 8, 1] * ([BLOCK_J, 8, 8] - [BLOCK_J, 8, 1])
+        transformed_weight = scale[:, :, None] * (unpack_weight - unpack_offset)
+        # print(transformed_weight.shape, activate.shape)
+        transformed_weight = transformed_weight.reshape(B0, B_MID)
+        # calculate
+        # (16, 64) * (64, 16)
+        z += tl.dot(transformed_weight, activate)
+
+    tl.store(z_ptr + offs_z, z, mask_z)
     return
 
 
@@ -705,7 +996,7 @@ def run_puzzles(args, puzzles: List[int]):
         ok = test(
             sum_kernel,
             sum_spec,
-            B={"B0": 1, "B1": 32},
+            B={"B0": 2, "B1": 32},
             nelem={"N0": 4, "N1": 32, "T": 200},
             print_log=print_log,
             device=device,
@@ -716,9 +1007,9 @@ def run_puzzles(args, puzzles: List[int]):
     if 8 in puzzles:
         print("Puzzle #8:")
         ok = test(
-            softmax_kernel,
+            softmax_kernel,     # softmax_kernel_brute_force
             softmax_spec,
-            B={"B0": 1, "B1": 32},
+            B={"B0": 2, "B1": 32},
             nelem={"N0": 4, "N1": 32, "T": 200},
             print_log=print_log,
             device=device,
@@ -744,7 +1035,7 @@ def run_puzzles(args, puzzles: List[int]):
         ok = test(
             conv2d_kernel,
             conv2d_spec,
-            B={"B0": 1},
+            B={"B0": 2},
             nelem={"N0": 4, "H": 8, "W": 8, "KH": 4, "KW": 4},
             print_log=print_log,
             device=device,
@@ -757,7 +1048,7 @@ def run_puzzles(args, puzzles: List[int]):
         ok = test(
             dot_kernel,
             dot_spec,
-            B={"B0": 16, "B1": 16, "B2": 1, "B_MID": 16},
+            B={"B0": 16, "B1": 16, "B2": 2, "B_MID": 16},
             nelem={"N0": 32, "N1": 32, "N2": 4, "MID": 32},
             print_log=print_log,
             device=device,
